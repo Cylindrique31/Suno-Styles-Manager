@@ -1,0 +1,19 @@
+0.1.0 Structuration des colonnes (Nom du Style, Tags Lyrics, Style musical, Styles Suno)  et des fonctionalités
+0.2.0 Ajout des boutons "Nouveau", "Editer", "Supprimer"
+0.3.0 Ajout de l'export en JSON
+0.4.0 Ajout de la fonction "Favoris"
+0.5.0 Ajout du moteur de recherche
+0.6.0 Structuration des colonnes pour rendre le visuel cohérent
+0.7.0 Ajout l'import JSON avec recherche de doublon en cas de fusion 
+0.8.0 Ajout de l'import depuis un lien de chanson Suno
+0.9.0 Traduction en sept langues
+1.0.0	Stabilisation de la version de référence, tests JSON et compatibilité des données historiques.
+1.1.0	Tags de style musical cliquables et filtrage par tag.
+1.2.0	Centrage des fenêtres, fermeture par clic extérieur et amélioration de l'affichage des tags musicaux.
+1.3.0	Amélioration visuelle des fenêtres et des boutons d'action.
+1.4.0	Manuel intégré, traduit en sept langues.
+1.5.0	Gestion facultative des liens Suno, suppression des liens et fenêtre « À propos ».
+1.5.1	Détection des doublons lors de l'analyse d'un lien Suno.
+1.6.0	Refonte de la recherche et séparation des critères de recherche.
+1.6.1	Retrait du lien Suno des critères de recherche et correction de l'icône de loupe.
+1.7.0	Audit des traductions et amélioration de l'indicateur d'état.
