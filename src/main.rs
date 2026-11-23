@@ -103,6 +103,9 @@ struct SunoApp {
     favorites_only: bool,
     active_music_tag: Option<String>,
     selected_id: Option<i64>,
+    selected_ids: HashSet<i64>,
+    selection_anchor_id: Option<i64>,
+    selection_click_handled: Option<i64>,
     editor_open: bool,
     editor_mode: EditorMode,
     draft: SunoStyle,
@@ -1486,14 +1489,14 @@ impl SunoApp {
                 _ => "Confirmer la suppression",
             },
             "delete_prompt" => match language {
-                "Français" => "Voulez-vous vraiment supprimer « {name} » ? Cette action est irréversible.",
-                "English" => "Are you sure you want to delete “{name}”? This action cannot be undone.",
-                "Deutsch" => "Möchten Sie „{name}“ wirklich löschen? Dieser Vorgang kann nicht rückgängig gemacht werden.",
-                "Español" => "¿Seguro que quieres eliminar «{name}»? Esta acción es irreversible.",
-                "Português" => "Tem a certeza de que pretende excluir «{name}»? Esta ação é irreversível.",
-                "中文" => "确定要删除“{name}”吗？此操作无法撤销。",
-                "العربية" => "هل تريد حقًا حذف «{name}»؟ لا يمكن التراجع عن هذا الإجراء.",
-                _ => "Voulez-vous vraiment supprimer « {name} » ? Cette action est irréversible.",
+                "Français" => "Voulez-vous vraiment supprimer les éléments sélectionnés ? Cette action est irréversible.",
+                "English" => "Do you really want to delete the selected items? This action cannot be undone.",
+                "Deutsch" => "Möchten Sie die ausgewählten Elemente wirklich löschen? Dieser Vorgang kann nicht rückgängig gemacht werden.",
+                "Español" => "¿Seguro que quieres eliminar los elementos seleccionados? Esta acción es irreversible.",
+                "Português" => "Tem a certeza de que pretende excluir os elementos selecionados? Esta ação é irreversível.",
+                "中文" => "确定要删除所选项目吗？此操作无法撤销。",
+                "العربية" => "هل تريد حقًا حذف العناصر المحددة؟ لا يمكن التراجع عن هذا الإجراء.",
+                _ => "Voulez-vous vraiment supprimer les éléments sélectionnés ? Cette action est irréversible.",
             },
             "delete_confirm" => match language {
                 "Français" => "Supprimer définitivement",
@@ -1752,7 +1755,7 @@ impl SunoApp {
         let mut app = Self { db, styles: vec![], search: String::new(), search_open: false,
             search_name: true, search_music_style: true, search_tags: true, search_style: true,
             search_exclusion: true, search_author: true, sort_by: "az".into(),
-            favorites_only: false, active_music_tag: None, selected_id: None,
+            favorites_only: false, active_music_tag: None, selected_id: None, selected_ids: HashSet::new(), selection_anchor_id: None, selection_click_handled: None,
             editor_open: false, editor_mode: EditorMode::New, draft: SunoStyle::default(), song_url: String::new(), suno_analysis_checked: false,
             status: SunoApp::tr(&settings.language, "ready").into(), confirm_delete: false, import_dialog_open: false, import_report: None, settings_open: false, settings_about: false, manual_open: false, settings, system_visuals: None };
         app.reload();
@@ -1766,7 +1769,13 @@ impl SunoApp {
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             });
         match result { Ok(rows) => self.styles = rows, Err(e) => self.status = format!("Erreur de lecture : {e}") }
-        if !self.styles.iter().any(|s| Some(s.id) == self.selected_id) { self.selected_id = None; }
+        self.selected_ids.retain(|id| self.styles.iter().any(|s| s.id == *id));
+        if !self.styles.iter().any(|s| Some(s.id) == self.selected_id) {
+            self.selected_id = self.selected_ids.iter().next().copied();
+        }
+        if !self.styles.iter().any(|s| Some(s.id) == self.selection_anchor_id) {
+            self.selection_anchor_id = self.selected_id;
+        }
     }
 
     fn open_new(&mut self) {
@@ -1828,12 +1837,68 @@ impl SunoApp {
         }
     }
 
-    fn delete_selected(&mut self) {
-        if let Some(id) = self.selected_id {
-            match self.db.execute("DELETE FROM styles WHERE id=?1", [id]) {
-                Ok(_) => { self.selected_id = None; self.confirm_delete = false; self.status = SunoApp::tr(&self.settings.language, "style_deleted").into(); self.reload(); }
-                Err(e) => self.status = format!("Erreur de suppression : {e}"),
+    fn select_row(&mut self, id: i64, modifiers: egui::Modifiers, visible_ids: &[i64]) {
+        if self.selection_click_handled == Some(id) { return; }
+        self.selection_click_handled = Some(id);
+        if modifiers.shift {
+            let anchor = self.selection_anchor_id.unwrap_or(self.selected_id.unwrap_or(id));
+            let start = visible_ids.iter().position(|candidate| *candidate == anchor);
+            let end = visible_ids.iter().position(|candidate| *candidate == id);
+            if let (Some(start), Some(end)) = (start, end) {
+                self.selected_ids.clear();
+                for candidate in &visible_ids[start.min(end)..=start.max(end)] {
+                    self.selected_ids.insert(*candidate);
+                }
+            } else {
+                self.selected_ids.insert(id);
             }
+        } else if modifiers.command || modifiers.ctrl {
+            if !self.selected_ids.remove(&id) {
+                self.selected_ids.insert(id);
+            }
+            self.selection_anchor_id = Some(id);
+        } else {
+            self.selected_ids.clear();
+            self.selected_ids.insert(id);
+            self.selection_anchor_id = Some(id);
+        }
+        self.selected_id = if self.selected_ids.contains(&id) { Some(id) } else { self.selected_ids.iter().next().copied() };
+    }
+
+    fn delete_selected(&mut self) {
+        if self.selected_ids.is_empty() {
+            if let Some(id) = self.selected_id { self.selected_ids.insert(id); }
+        }
+        if self.selected_ids.is_empty() { return; }
+        let ids: Vec<i64> = self.selected_ids.iter().copied().collect();
+        // Terminer la transaction dans un bloc séparé afin que l'emprunt mutable
+        // de self.db soit libéré avant d'appeler self.reload().
+        let deletion_result = {
+            match self.db.transaction() {
+                Ok(tx) => {
+                    ids.iter()
+                        .try_for_each(|id| tx.execute("DELETE FROM styles WHERE id=?1", [id]).map(|_| ()))
+                        .and_then(|_| tx.commit())
+                }
+                Err(e) => Err(e),
+            }
+        };
+
+        match deletion_result {
+            Ok(()) => {
+                let count = ids.len();
+                self.selected_ids.clear();
+                self.selected_id = None;
+                self.selection_anchor_id = None;
+                self.confirm_delete = false;
+                self.status = if count == 1 {
+                    SunoApp::tr(&self.settings.language, "style_deleted").into()
+                } else {
+                    format!("{count} éléments supprimés.")
+                };
+                self.reload();
+            }
+            Err(e) => self.status = format!("Erreur de suppression : {e}"),
         }
     }
 
@@ -1970,6 +2035,7 @@ fn library_filter_chip(ui: &mut egui::Ui, selected: bool, label: &str, icon: &st
 
 impl eframe::App for SunoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.selection_click_handled = None;
         // Utilisé pour ne pas interpréter le clic d'ouverture comme un clic extérieur.
         let import_was_open_at_frame_start = self.import_dialog_open;
         let settings_was_open_at_frame_start = self.settings_open;
@@ -1989,11 +2055,12 @@ impl eframe::App for SunoApp {
         let modal_open = self.editor_open || self.settings_open || self.manual_open || self.import_dialog_open
             || self.import_report.is_some() || self.confirm_delete;
         if !modal_open && !ctx.wants_keyboard_input() {
-            let (new_shortcut, edit_shortcut, search_shortcut, delete_shortcut,
+            let (new_shortcut, edit_shortcut, search_shortcut, select_all_shortcut, delete_shortcut,
                  copy_style_shortcut, copy_exclusion_shortcut, escape_shortcut) = ctx.input(|i| (
                 i.modifiers.command && i.key_pressed(egui::Key::N),
                 i.modifiers.command && i.key_pressed(egui::Key::E),
                 i.modifiers.command && i.key_pressed(egui::Key::F),
+                i.modifiers.command && i.key_pressed(egui::Key::A),
                 i.key_pressed(egui::Key::Delete),
                 i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::C),
                 i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::C),
@@ -2006,7 +2073,20 @@ impl eframe::App for SunoApp {
             } else if search_shortcut {
                 self.search_open = true;
                 self.status = "Recherche ouverte (Ctrl+F).".into();
-            } else if delete_shortcut && self.selected_id.is_some() {
+            } else if select_all_shortcut {
+                self.selected_ids = self.styles.iter().filter(|s| (!self.favorites_only || s.favorite)
+                    && self.active_music_tag.as_ref().map_or(true, |tag| music_style_has_tag(&s.music_style, tag))
+                    && { let q = self.search.to_lowercase(); q.is_empty() ||
+                        (self.search_name && s.name.to_lowercase().contains(&q)) ||
+                        (self.search_music_style && s.music_style.to_lowercase().contains(&q)) ||
+                        (self.search_tags && s.tags.to_lowercase().contains(&q)) ||
+                        (self.search_style && s.style.to_lowercase().contains(&q)) ||
+                        (self.search_exclusion && s.exclusion.to_lowercase().contains(&q)) ||
+                        (self.search_author && s.author.to_lowercase().contains(&q)) })
+                    .map(|s| s.id).collect();
+                self.selected_id = self.selected_ids.iter().next().copied();
+                self.selection_anchor_id = self.selected_id;
+            } else if delete_shortcut && (!self.selected_ids.is_empty() || self.selected_id.is_some()) {
                 self.confirm_delete = true;
             } else if copy_style_shortcut {
                 if let Some(style) = self.styles.iter().find(|s| Some(s.id) == self.selected_id).cloned() {
@@ -2041,7 +2121,7 @@ impl eframe::App for SunoApp {
                     });
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
-                        let has_selection = self.selected_id.is_some();
+                        let has_selection = !self.selected_ids.is_empty() || self.selected_id.is_some();
                         egui::Frame::group(ui.style())
                             .inner_margin(egui::Margin::symmetric(6, 6))
                             .show(ui, |ui| {
@@ -2139,6 +2219,7 @@ impl eframe::App for SunoApp {
             _ => visible.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         }
         let displayed_count = visible.len();
+        let visible_ids: Vec<i64> = visible.iter().map(|s| s.id).collect();
         let total_count = self.styles.len();
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2264,13 +2345,13 @@ impl eframe::App for SunoApp {
                                     egui::Sense::click(),
                                 );
                                 if row_response.clicked() {
-                                    self.selected_id = Some(s.id);
+                                    self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids);
                                 }
                                 if row_response.double_clicked() {
-                                    self.selected_id = Some(s.id);
+                                    self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids);
                                     edit_on_double_click = Some(s.id);
                                 }
-                                let is_selected = self.selected_id == Some(s.id);
+                                let is_selected = self.selected_ids.contains(&s.id) || self.selected_id == Some(s.id);
                                 let row_hovered = row_rect.contains(ui.input(|input| input.pointer.hover_pos().unwrap_or(egui::Pos2::new(-1.0, -1.0))));
                                 let row_fill = if is_selected {
                                     ui.visuals().selection.bg_fill
@@ -2317,7 +2398,7 @@ impl eframe::App for SunoApp {
                                                 .wrap()
                                                 .sense(egui::Sense::click()),
                                         ).on_hover_text(SunoApp::tr(&self.settings.language, "tooltip_name"));
-                                        if name_response.clicked() { self.selected_id = Some(s.id); }
+                                        if name_response.clicked() { self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids); }
                                         if name_response.double_clicked() { edit_on_double_click = Some(s.id); }
                                         if !s.suno_url.trim().is_empty() {
                                             ui.add_space(2.0);
@@ -2365,7 +2446,7 @@ impl eframe::App for SunoApp {
                                                             if response.clicked() {
                                                                 self.active_music_tag = Some(tag.to_owned());
                                                                 self.favorites_only = false;
-                                                                self.selected_id = Some(s.id);
+                                                                self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids);
                                                             }
                                                             if response.double_clicked() { edit_on_double_click = Some(s.id); }
                                                         }
@@ -2406,14 +2487,14 @@ impl eframe::App for SunoApp {
                                                                 .show(ui, |ui| {
                                                                     ui.add(egui::Label::new(egui::RichText::new(tag).size(10.5)).sense(egui::Sense::click()))
                                                                 }).inner;
-                                                            if response.clicked() { self.selected_id = Some(s.id); }
+                                                            if response.clicked() { self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids); }
                                                             if response.double_clicked() { edit_on_double_click = Some(s.id); }
                                                         }
                                                     });
                                                 } else {
                                                     let tag_color = if is_selected { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
                                                     let response = ui.add(egui::Label::new(egui::RichText::new(&s.tags).size(11.5).color(tag_color)).wrap().sense(egui::Sense::click()));
-                                                    if response.clicked() { self.selected_id = Some(s.id); }
+                                                    if response.clicked() { self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids); }
                                                     if response.double_clicked() { edit_on_double_click = Some(s.id); }
                                                 }
                                             });
@@ -2432,7 +2513,7 @@ impl eframe::App for SunoApp {
                                                 ui.set_width(style_w - 4.0);
                                                 let response = ui.add(egui::Label::new(egui::RichText::new(&s.style).size(11.5)).wrap().sense(egui::Sense::click()));
                                                 if response.double_clicked() { edit_on_double_click = Some(s.id); }
-                                                if response.clicked() { self.selected_id = Some(s.id); }
+                                                if response.clicked() { self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids); }
                                             });
                                         ui.add_space(1.0);
                                         ui.horizontal(|ui| {
@@ -2467,7 +2548,7 @@ impl eframe::App for SunoApp {
                                                 ui.set_width(exclusion_w - 4.0);
                                                 let response = ui.add(egui::Label::new(egui::RichText::new(&s.exclusion).size(11.5)).wrap().sense(egui::Sense::click()));
                                                 if response.double_clicked() { edit_on_double_click = Some(s.id); }
-                                                if response.clicked() { self.selected_id = Some(s.id); }
+                                                if response.clicked() { self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids); }
                                             });
                                         ui.add_space(1.0);
                                         ui.horizontal(|ui| {
@@ -2494,7 +2575,7 @@ impl eframe::App for SunoApp {
                                     [author_w, row_height],
                                     egui::Label::new(egui::RichText::new(&s.author).size(11.5).color(if is_selected { ui.visuals().text_color() } else { ui.visuals().weak_text_color() })).wrap().sense(egui::Sense::click()),
                                 ).on_hover_text(SunoApp::tr(&self.settings.language, "author"));
-                                if author_response.clicked() { self.selected_id = Some(s.id); }
+                                if author_response.clicked() { self.select_row(s.id, ctx.input(|i| i.modifiers), &visible_ids); }
                                 if author_response.double_clicked() { edit_on_double_click = Some(s.id); }
                                 ui.end_row();
                             }
@@ -2600,7 +2681,7 @@ impl eframe::App for SunoApp {
                                 ("5. Search", "Open Search to choose which fields are searched, such as the name, Lyrics tags, musical style, or exclusion prompt. Clear the search to show matching entries without the text filter."),
                                 ("6. Import and export", "Export saves your library to a JSON file. Import offers Merge, which adds entries while keeping existing ones, or Overwrite, which replaces the library. Keep a backup before overwriting."),
                                 ("7. Options", "Options lets you change the interface language and display theme. Your styles are stored locally in the application's SQLite database."),
-                                ("Keyboard shortcuts", "Ctrl+N: new style   •   Ctrl+E: edit selected style   •   Ctrl+F: open search   •   Delete: request deletion   •   Ctrl+C: copy Style prompt   •   Ctrl+Shift+C: copy Exclusion prompt   •   Escape: close search."),
+                                ("Keyboard shortcuts", "Ctrl+A: select all visible entries   •   Ctrl+N: new style   •   Ctrl+E: edit selected style   •   Ctrl+F: open search   •   Delete: request deletion   •   Ctrl+C: copy Style prompt   •   Ctrl+Shift+C: copy Exclusion prompt   •   Escape: close search."),
                             ],
                             "Deutsch" => &[
                                 ("1. Bibliothek", "Die Haupttabelle enthält deine gespeicherten Suno-Stile. Wähle eine Zeile aus, um Aktionen auszuführen. Verwende Alle Stile, Favoriten oder ein Musikstil-Tag zum Filtern."),
@@ -2630,7 +2711,7 @@ impl eframe::App for SunoApp {
                                 ("5. Pesquisa", "Abra Pesquisar para escolher os campos pesquisados: nome, tags Lyrics, estilo musical ou exclusões. Apague o texto de pesquisa para remover esse filtro."),
                                 ("6. Importar e exportar", "Exportar guarda a biblioteca num ficheiro JSON. Importar permite Fundir, mantendo as entradas existentes, ou Substituir, trocando a biblioteca. Faça uma cópia de segurança antes de substituir."),
                                 ("7. Opções", "Em Opções pode alterar o idioma e o tema visual. Os estilos são guardados localmente numa base de dados SQLite."),
-                                ("Atalhos de teclado", "Ctrl+N: novo estilo • Ctrl+E: editar estilo selecionado • Ctrl+F: abrir pesquisa • Delete: confirmar eliminação • Ctrl+C: copiar prompt Style • Ctrl+Shift+C: copiar prompt Exclusion • Esc: fechar pesquisa."),
+                                ("Atalhos de teclado", "Ctrl+A: selecionar todos os itens visíveis • Ctrl+N: novo estilo • Ctrl+E: editar estilo selecionado • Ctrl+F: abrir pesquisa • Delete: confirmar eliminação • Ctrl+C: copiar prompt Style • Ctrl+Shift+C: copiar prompt Exclusion • Esc: fechar pesquisa."),
                             ],
                             "中文" => &[
                                 ("1. 样式库", "主表格显示已保存的 Suno 样式。单击一行可选择条目并使用相关操作。可通过“所有样式”“收藏”或音乐风格标签筛选。"),
@@ -2650,12 +2731,12 @@ impl eframe::App for SunoApp {
                                 ("٥. البحث", "افتح البحث واختر الحقول التي تريد البحث فيها، مثل الاسم أو وسوم Lyrics أو النمط الموسيقي أو الاستثناءات. امسح نص البحث لإزالة هذا المرشح."),
                                 ("٦. الاستيراد والتصدير", "يحفظ التصدير المكتبة في ملف JSON. يتيح الاستيراد الدمج مع الاحتفاظ بالإدخالات الحالية أو الاستبدال الذي يستبدل المكتبة. أنشئ نسخة احتياطية قبل الاستبدال."),
                                 ("٧. الخيارات", "يمكنك تغيير اللغة ومظهر الواجهة من الخيارات. تُحفظ الأنماط محليًا في قاعدة بيانات SQLite."),
-                                ("اختصارات لوحة المفاتيح", "Ctrl+N: نمط جديد • Ctrl+E: تعديل النمط المحدد • Ctrl+F: فتح البحث • Delete: طلب الحذف • Ctrl+C: نسخ مطالبة Style • Ctrl+Shift+C: نسخ مطالبة Exclusion • Esc: إغلاق البحث."),
+                                ("اختصارات لوحة المفاتيح", "Ctrl+A: تحديد كل العناصر الظاهرة • Ctrl+N: نمط جديد • Ctrl+E: تعديل النمط المحدد • Ctrl+F: فتح البحث • Delete: طلب الحذف • Ctrl+C: نسخ مطالبة Style • Ctrl+Shift+C: نسخ مطالبة Exclusion • Esc: إغلاق البحث."),
                             ],
                             _ => &[
                                 ("1. La bibliothèque", "Le tableau principal contient les styles Suno enregistrés. Cliquez sur une ligne pour la sélectionner. Utilisez « Tous les styles », « Favoris » ou un tag de style musical pour filtrer la liste."),
                                 ("2. Ajouter un style", "Cliquez sur « Nouveau ». Vous pouvez coller un lien de chanson Suno puis cliquer sur « Analyser » pour préremplir les informations disponibles. Relisez et complétez les champs avant d’enregistrer ; la saisie manuelle reste possible."),
-                                ("3. Modifier ou supprimer", "Sélectionnez une ligne puis cliquez sur « Édition », ou double-cliquez sur la ligne. Modifiez les champs puis enregistrez. La suppression demande une confirmation avant d’effacer définitivement l’entrée."),
+                                ("3. Modifier ou supprimer", "Utilisez Ctrl+clic pour sélectionner plusieurs lignes, Maj+clic pour sélectionner une plage et Ctrl+A pour sélectionner toutes les lignes visibles. Cliquez ensuite sur « Supprimer », ou double-cliquez sur la ligne. Modifiez les champs puis enregistrez. La suppression demande une confirmation avant d’effacer définitivement l’entrée."),
                                 ("4. Style musical et tags Lyrics", "Le champ « Style musical » contient vos mots-clés, séparés par des virgules. Cliquez sur un tag dans la colonne pour filtrer les entrées qui le contiennent. Les tags Lyrics correspondent aux balises de la zone Lyrics."),
                                 ("5. Recherche", "Ouvrez « Rechercher » et choisissez les champs à parcourir : nom, tags Lyrics, style musical ou exclusions. Vous pouvez vider la recherche pour retirer le filtre textuel."),
                                 ("6. Importer et exporter", "« Exporter » enregistre la bibliothèque dans un fichier JSON. À l’import, « Fusionner » conserve les entrées existantes et ajoute les nouvelles ; « Écraser » remplace la bibliothèque. Faites une sauvegarde avant un écrasement."),
@@ -2840,8 +2921,7 @@ impl eframe::App for SunoApp {
 
         if self.confirm_delete {
             egui::Window::new(SunoApp::tr(&self.settings.language, "delete_title")).collapsible(false).resizable(false).show(ctx, |ui| {
-                let name = self.styles.iter().find(|s| Some(s.id) == self.selected_id).map(|s| s.name.as_str()).unwrap_or("ce style");
-                ui.label(SunoApp::tr(&self.settings.language, "delete_prompt").replace("{name}", name));
+                ui.label(SunoApp::tr(&self.settings.language, "delete_prompt"));
                 ui.horizontal(|ui| {
                     if modal_button(ui, &SunoApp::tr(&self.settings.language, "delete_confirm"), ModalButtonTone::Danger).clicked() { self.delete_selected(); }
                     if modal_button(ui, &SunoApp::tr(&self.settings.language, "cancel"), ModalButtonTone::Secondary).clicked() { self.confirm_delete = false; }
